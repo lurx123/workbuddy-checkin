@@ -1,0 +1,197 @@
+name: WorkBuddy Dual Checkin
+
+# ============================================================
+# 双时段幂等串行签到 · 两个国内号 A / B
+#
+# 与上游 lk610322lk-creator/workbuddy-cloud-checkin 的差异：
+#   · 上游是单账号（硬编码 WB_CHECKIN_TOKEN / WB_CHECKIN_UID）
+#   · 本工作流按账号维度参数化：WB_TOKEN_A / WB_UID_A / WB_TOKEN_B / WB_UID_B
+#   · 用 matrix + max-parallel:1 实现「A 签完才轮 B」的真正串行
+#   · 双时段：主干 08:30(UTC 00:30) + 兜底 20:30(UTC 12:30)，接口幂等
+#
+# ⚠️ 关于 deviceId（实测结论，勿轻信想当然）：
+#   本文件**不发** X-Device-Id 之类的头，因为 2026-11-09 实测该接口
+#   对 X-Device-Id / X-Qimei / X-Client-Id（含空值、含随机值、带 UA）
+#   一律返回 HTTP 200，响应体与不带该头时完全一致 —— 即服务端不据此区分设备。
+#   因此「各用唯一 deviceId」在接口层无对应机制，账号隔离只能靠**独立令牌 + 独立 uid**。
+#   保留 WB_DEVICE_A / WB_DEVICE_B 两个 Secret 仅作为**台账标识**（写入运行摘要，
+#   便于事后核对哪个账号在哪台设备上登录过），不参与鉴权。
+#
+# 鉴权只看真实 HTTP 状态码，绝不用 grep 响应体（requestId 是随机 UUID，
+# 里含 "401" 会导致约 0.57%/次的误判）。
+# ============================================================
+
+on:
+  schedule:
+    # 主干：北京时间 08:30 = UTC 00:30（GitHub cron 有 5~30 分钟延迟属正常）
+    - cron: '30 0 * * *'
+    # 兜底：北京时间 20:30 = UTC 12:30
+    # 只有一条 cron 时，若那次运行整体未发生（GitHub 延迟/丢弃、工作流被停用），
+    # 当天就静默漏签；两条互为保险。接口幂等，撞车只会返回 code=10001。
+    - cron: '30 12 * * *'
+  workflow_dispatch:
+    inputs:
+      diag:
+        description: '只做令牌体检（不签到）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 定时与手动触发偶发重叠时排队执行，避免同一账号被并发调用
+concurrency:
+  group: workbuddy-dual-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    if: ${{ !inputs.diag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # ⚠️ 这是「串行」的关键：矩阵默认并行，必须显式限 1，否则 A/B 会同时打接口。
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          - account: A
+            token_secret: WB_TOKEN_A
+            uid_secret: WB_UID_A
+            device_secret: WB_DEVICE_A
+          - account: B
+            token_secret: WB_TOKEN_B
+            uid_secret: WB_UID_B
+            device_secret: WB_DEVICE_B
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkin ${{ matrix.account }}
+        id: ck
+        env:
+          ACCOUNT: ${{ matrix.account }}
+          WB_TOKEN: ${{ secrets[matrix.token_secret] }}
+          WB_UID: ${{ secrets[matrix.uid_secret] }}
+          WB_DEVICE: ${{ secrets[matrix.device_secret] }}
+        # ⚠️ 维护须知：run: | 是 YAML 块标量，标量内所有行缩进必须 >= 10 个空格。
+        #    一旦出现顶格行，块标量提前终止 → 整份 YAML 解析失败 →
+        #    表现为 0s failure，且 dispatch 报 422。
+        run: |
+          set -uo pipefail
+          API="https://copilot.tencent.com"
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+
+          if [ -z "${WB_TOKEN:-}" ] || [ -z "${WB_UID:-}" ]; then
+            echo "::error::账号 ${ACCOUNT} 缺少 Secrets：${WB_TOKEN:+令牌已注入}${WB_TOKEN:-${ACCOUNT} 令牌为空}"
+            out state error
+            out detail "账号 ${ACCOUNT} 的令牌/uid Secret 为空"
+            exit 1
+          fi
+          echo "账号 ${ACCOUNT} | uid=${WB_UID} | 设备标识(台账)=${WB_DEVICE:-未配置}"
+
+          # 只对网络层失败（000/空/5xx）重试；业务响应（200/4xx）原样返回。
+          # 重试安全：daily-checkin 幂等（重复调用返回 code=10001，不重复领取）。
+          # ⚠️ 诊断信息必须打到 stderr，调用方用 $( ) 捕获 stdout，混进去会破坏解析。
+          call_api() {
+            local path="$1" i=1 resp http
+            while : ; do
+              resp="$(curl -s -m 20 -w '\n%{http_code}' -X POST \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json" \
+                -H "Authorization: Bearer ${WB_TOKEN}" \
+                -H "X-User-Id: ${WB_UID}" \
+                -d '{}' "${API}/${path}" || true)"
+              http="$(printf '%s\n' "$resp" | tail -n 1)"
+              case "$http" in
+                000|""|5*) ;;
+                *) printf '%s\n' "$resp"; return 0 ;;
+              esac
+              if [ "$i" -ge 3 ]; then printf '%s\n' "$resp"; return 0; fi
+              echo ">> ${path} 第 ${i}/3 次返回 HTTP ${http:-无}（疑似网络抖动），5s 后重试 ..." >&2
+              sleep 5
+              i=$((i+1))
+            done
+          }
+
+          echo ">> [${ACCOUNT}] 查询签到状态 ..."
+          STATUS="$(call_api billing/meter/checkin-status)"
+          ST_HTTP="$(printf '%s\n' "$STATUS" | tail -n 1)"
+          echo "checkin-status HTTP=${ST_HTTP}"
+          if [ "$ST_HTTP" = "401" ] || [ "$ST_HTTP" = "403" ]; then
+            echo "::error::账号 ${ACCOUNT} 令牌已失效（HTTP ${ST_HTTP}）→ 本机打开桌面端后重跑 token 同步"
+            out state error
+            out detail "账号 ${ACCOUNT} 令牌已失效（HTTP ${ST_HTTP}）"
+            exit 1
+          fi
+
+          echo ">> [${ACCOUNT}] 执行签到 ..."
+          RESP="$(call_api billing/meter/daily-checkin)"
+          HTTP="$(printf '%s\n' "$RESP" | tail -n 1)"
+          BODY="$(printf '%s\n' "$RESP" | sed '$d')"
+          echo "daily-checkin HTTP=${HTTP}"
+
+          if [ "$HTTP" = "401" ] || [ "$HTTP" = "403" ]; then
+            echo "::error::账号 ${ACCOUNT} 令牌已失效（HTTP ${HTTP}）→ 本机打开桌面端后重跑 token 同步"
+            out state error
+            out detail "账号 ${ACCOUNT} 令牌已失效（HTTP ${HTTP}）"
+            exit 1
+          fi
+
+          CODE="$(printf '%s' "$BODY" | jq -r '.code // "nil"' 2>/dev/null)"
+          case "$CODE" in
+            0)
+              CREDIT="$(printf '%s' "$BODY" | jq -r '.data.credit // "-"')"
+              STREAK="$(printf '%s' "$BODY" | jq -r '.data.streak_days // "-"')"
+              echo "::notice::账号 ${ACCOUNT} 签到成功，领取 ${CREDIT} 积分，连续 ${STREAK} 天"
+              out state success
+              out detail "账号 ${ACCOUNT} 签到成功，领取 ${CREDIT} 积分，连续 ${STREAK} 天"
+              ;;
+            10001)
+              echo "::notice::账号 ${ACCOUNT} 今日已签到，无需重复领取"
+              out state already
+              out detail "账号 ${ACCOUNT} 今日已签到（幂等重复触发，属正常）"
+              ;;
+            *)
+              echo "::error::账号 ${ACCOUNT} 签到未成功 code=${CODE} body=${BODY}"
+              out state error
+              out detail "账号 ${ACCOUNT} 签到未成功：code=${CODE}"
+              exit 1
+              ;;
+          esac
+
+      - name: Summary ${{ matrix.account }}
+        if: always()
+        env:
+          ACCOUNT: ${{ matrix.account }}
+          CK_STATE: ${{ steps.ck.outputs.state }}
+          CK_DETAIL: ${{ steps.ck.outputs.detail }}
+          WB_UID: ${{ secrets[matrix.uid_secret] }}
+          WB_DEVICE: ${{ secrets[matrix.device_secret] }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+        run: |
+          set -uo pipefail
+          TRIGGER="手动触发"
+          case "${SCHEDULE_CRON:-}" in
+            "30 0 * * *")  TRIGGER="主干调度（08:30）" ;;
+            "30 12 * * *") TRIGGER="兜底调度（20:30）" ;;
+            "")            TRIGGER="手动触发" ;;
+            *)             TRIGGER="定时调度（${SCHEDULE_CRON}）" ;;
+          esac
+          NOW="$(date -u -d '+8 hours' '+%Y-%m-%d %H:%M')"
+          STATE="${CK_STATE:-unknown}"
+          DETAIL="${CK_DETAIL:-无输出}"
+          {
+            echo "### 账号 ${ACCOUNT}"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| uid | \`${WB_UID}\` |"
+            echo "| 设备标识（台账，不参与鉴权） | \`${WB_DEVICE:-未配置}\` |"
+            echo "| 结果 | **${STATE}** |"
+            echo "| 详情 | ${DETAIL} |"
+            echo "| 触发 | ${TRIGGER} |"
+            echo "| 时间 | ${NOW}（北京时间） |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "账号 ${ACCOUNT} → ${STATE}｜${DETAIL}"
