@@ -1,0 +1,90 @@
+name: WorkBuddy Cloud Checkin
+
+# ============================================================
+# 云端每日签到 · 不依赖本机开机
+#
+# 为什么之前的库会漏签 18 天（实测证据）：
+#   gh run list 只有 2 条 workflow_dispatch（手动），**0 条 schedule**。
+#   即 cron 一次都没触发过。原因通常是：
+#     · 私有仓库连续 60 天无提交 → GitHub 自动停用 schedule
+#     · 新建仓库的 schedule 要等 workflow 被默认分支引用后才会生效
+#     · 私有仓库 schedule 在用量高峰会被延迟甚至丢弃
+#   所以「配了 cron」≠「一定会跑」，必须用多条 cron + 幂等设计兜底。
+#
+# 本工作流的对策：
+#   1) 6 条 cron 覆盖早/中/晚，接口幂等，重复跑只返回 code=10001
+#   2) runs-on 上不依赖任何第三方 action，纯 python3 标准库
+#   3) 每个账号独立 job，一个失败不影响另一个
+#   4) 关键：workflow_dispatch 保留，手机上也能一键补签
+# ============================================================
+
+on:
+  schedule:
+    # 主时段：北京时间 08:05 / 08:35（上班前完成）
+    - cron: '5 0 * * *'
+    - cron: '35 0 * * *'
+    # 午间兜底：北京时间 12:20
+    - cron: '20 4 * * *'
+    # 傍晚兜底：北京时间 18:20
+    - cron: '20 10 * * *'
+    # 夜间兜底：北京时间 21:20 / 23:20
+    - cron: '20 13 * * *'
+    - cron: '20 15 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '即使已签到也强制再调一次接口（默认 false）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 多条 cron 可能在同一分钟撞车，排队而不是并行
+concurrency:
+  group: workbuddy-cloud-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - account: A
+            realm: cn
+          - account: B
+            realm: cn
+          - account: C
+            realm: intl
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkin ${{ matrix.account }} (${{ matrix.realm }})
+        env:
+          WB_TOKEN: ${{ secrets[format('WB_TOKEN_{0}', matrix.account)] }}
+          WB_REFRESH: ${{ secrets[format('WB_REFRESH_{0}', matrix.account)] }}
+          WB_UID: ${{ secrets[format('WB_UID_{0}', matrix.account)] }}
+          WB_REALM: ${{ matrix.realm }}
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -uo pipefail
+          if [ -z "${WB_UID:-}" ]; then
+            echo "::error::账号 ${{ matrix.account }} 缺少 WB_UID_${{ matrix.account }}"
+            exit 1
+          fi
+          if [ -z "${WB_TOKEN:-}" ] && [ -z "${WB_REFRESH:-}" ]; then
+            echo "::error::账号 ${{ matrix.account }} 的令牌与 refreshToken 都为空"
+            exit 1
+          fi
+          python3 cloud/checkin_one.py
+
+      - name: Report on failure
+        if: failure()
+        run: |
+          echo "::warning::账号 ${{ matrix.account }} 签到步骤失败，请查看上方日志"
+          echo "### ❌ 账号 ${{ matrix.account }} 失败" >> "$GITHUB_STEP_SUMMARY"
