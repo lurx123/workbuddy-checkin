@@ -19,6 +19,8 @@ name: WorkBuddy Cloud Checkin
 #   2) runs-on 上不依赖任何第三方 action，纯 python3 标准库
 #   3) 每个账号独立 job，一个失败不影响另一个
 #   4) 关键：workflow_dispatch 保留，手机上也能一键补签
+#   5) 2026-11-11 起增加 cat job：猫猫派出/领奖也上云，本机不开机也能拿
+#      每天那 5~10 积分（成长任务和连登兑换仍需本机）
 # ============================================================
 
 on:
@@ -91,6 +93,54 @@ jobs:
         run: |
           echo "::warning::账号 ${{ matrix.account }} 签到步骤失败，请查看上方日志"
           echo "### ❌ 账号 ${{ matrix.account }} 失败" >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # 猫猫旅行：派出 / 领奖（本机不开机时唯一还能拿到的积分）
+  #
+  # 一天只能派 1 趟（派完 daily_limit_reached 立刻为 true），所以 6 条
+  # cron 都跑也不会多派 —— 逻辑本身幂等：
+  #   idle 且当日没派过 → 派；idle 且已派过 → 不动
+  #   traveling 没到站 → 什么都不做
+  #   traveling 已过到站时间 或 arrived → 领奖（+5~10 积分）
+  # 实测 08:05 派出 → 12:20 到站领取正好一个完整周期，不用改 cron。
+  #
+  # 只要 A / B 两个国内号 —— 国际站没有成长中心。
+  # 接口与签到同域同鉴权，实测不需要设备指纹（见 cat_one.py 注释）。
+  # ============================================================
+  cat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - account: A
+          - account: B
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cat travel ${{ matrix.account }}
+        env:
+          WB_TOKEN: ${{ secrets[format('WB_TOKEN_{0}', matrix.account)] }}
+          WB_REFRESH: ${{ secrets[format('WB_REFRESH_{0}', matrix.account)] }}
+          WB_UID: ${{ secrets[format('WB_UID_{0}', matrix.account)] }}
+          WB_REALM: cn
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -uo pipefail
+          if [ -z "${WB_UID:-}" ]; then
+            echo "::error::账号 ${{ matrix.account }} 缺少 WB_UID_${{ matrix.account }}"
+            exit 1
+          fi
+          python3 cloud/cat_one.py
+
+      - name: Report on failure
+        if: failure()
+        run: |
+          echo "::warning::账号 ${{ matrix.account }} 猫猫步骤失败，请查看上方日志"
+          echo "### ❌ 猫猫 ${{ matrix.account }} 失败" >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================
   # 自保活：防止「60 天无活动 → schedule 被自动停用」
