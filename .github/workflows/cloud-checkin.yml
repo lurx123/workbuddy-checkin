@@ -6,9 +6,12 @@ name: WorkBuddy Cloud Checkin
 # 为什么之前的库会漏签 18 天（实测证据）：
 #   gh run list 只有 2 条 workflow_dispatch（手动），**0 条 schedule**。
 #   即 cron 一次都没触发过。原因通常是：
-#     · 私有仓库连续 60 天无提交 → GitHub 自动停用 schedule
+#     · 仓库连续 60 天无活动 → GitHub 自动停用 schedule
+#       （官方原文：In a public repository, scheduled workflows are automatically
+#         disabled when no repository activity has occurred in 60 days.
+#         本仓库是 public，同样适用；预计 2027-01-08 左右触发）
 #     · 新建仓库的 schedule 要等 workflow 被默认分支引用后才会生效
-#     · 私有仓库 schedule 在用量高峰会被延迟甚至丢弃
+#     · schedule 在用量高峰会被延迟甚至丢弃
 #   所以「配了 cron」≠「一定会跑」，必须用多条 cron + 幂等设计兜底。
 #
 # 本工作流的对策：
@@ -88,3 +91,44 @@ jobs:
         run: |
           echo "::warning::账号 ${{ matrix.account }} 签到步骤失败，请查看上方日志"
           echo "### ❌ 账号 ${{ matrix.account }} 失败" >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # 自保活：防止「60 天无活动 → schedule 被自动停用」
+  #
+  # 只在中班 cron 和手动触发时运行，避免一天 6 次无谓 checkout。
+  # 只有当仓库已经空闲 >= 30 天时才真的提交 —— 正常情况下两个月才产生
+  # 一条 commit，历史不会被刷屏。
+  #
+  # 为什么放在 workflow 里而不是本机脚本：
+  #   本机方案依赖电脑开机，而云端层的意义恰恰就是「不开机也能跑」。
+  #   自保活完全在 GitHub 侧闭环，不需要本机、也不需要长期 PAT。
+  #
+  # 配套监控：本机 `python cloud/keepalive.py`（已接入 09:00 复核任务）
+  #   独立核查同一件事。万一自提交不被计入活动，45 天预警仍留 15 天缓冲。
+  # ============================================================
+  keepalive:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '20 4 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Touch activity only when idle
+        run: |
+          set -euo pipefail
+          idle_days=$(( ( $(date -u +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "仓库已空闲 ${idle_days} 天"
+          if [ "$idle_days" -lt 30 ]; then
+            echo "未到 30 天阈值，跳过提交（保持提交历史干净）"
+            exit 0
+          fi
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > KEEPALIVE.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add KEEPALIVE.txt
+          git commit -m "chore: keepalive activity reset (idle ${idle_days}d)"
+          git push
+          echo "### ✅ 已重置 60 天计时器（本次空闲 ${idle_days} 天）" >> "$GITHUB_STEP_SUMMARY"
